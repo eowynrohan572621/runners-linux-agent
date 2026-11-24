@@ -38,7 +38,7 @@ jobs:
 
       - name: Install the Linux Docker VM tools
         run: |
-          brew install colima qemu
+          brew install colima docker qemu
           colima version
           limactl --version
 
