@@ -1,43 +1,45 @@
-# Runners Linux agent
+# eowynrohan572621 Runners Linux agent
 
-One standard GitHub-hosted `ubuntu-24.04` runner joins an existing Runners
-control plane as a native Docker workload agent. Docker and Compose are checked
-on startup. The controller's native agent bundle is downloaded and verified
-before execution.
+This independent, non-fork repository contributes one standard Ubuntu 24.04
+GitHub-hosted machine to the existing Runners fleet, tagged `github-linux`.
+The bootstrap, workflow and tests are stored in this repository. It does not
+check out, invoke workflows from, or require credentials from another pool.
+The current native fleet agent is downloaded from the fleet control plane and
+verified against its SHA-256 digest before execution.
 
-## Scheduling
+## Independent scheduling
 
-- An hourly schedule at minute 23 UTC requests a replacement.
-- A concurrency group permits one running host and one waiting replacement.
-  New requests replace an older waiting request without cancelling the active host.
-- Each job has a 345-minute budget and reports its remaining lifetime to the
-  controller. It requests a drain and stops before GitHub's six-hour limit.
-- The next waiting run then starts on a fresh Linux host. Volumes are ephemeral;
-  persistent application data needs external storage.
+An hourly trigger at minute **23 UTC** requests a replacement. The three
+account triggers are staggered: Eowyn :23, Sophie :43 and Luna :03. GitHub scopes
+the concurrency group to this repository; it permits one active machine and
+one pending replacement. New requests preserve the running job and replace
+an older pending request. There is no shared pool scheduler or cross-account
+API token in the workflow.
 
-GitHub may delay or drop scheduled requests, and disables public-repository
-schedules after 60 days without repository activity. The schedule has no end
-date, but uninterrupted or perpetual hosting cannot be guaranteed.
+Each scheduled lease has a 345-minute budget and drains before GitHub's
+six-hour job limit. A shorter manual first lease can stagger initial retirements;
+later scheduled leases return to 345 minutes. The pending run starts after the
+active run finishes. GitHub can delay or drop scheduled requests, and public
+repository schedules disable after 60 days without repository activity. These
+are best-effort schedules, with no uninterrupted-hosting guarantee.
 
 ## Configuration
 
-Repository variable `CONTROL_URL` contains the HTTPS controller origin.
-Repository secret `JOIN_TOKEN` contains the fleet join token. The runtime agent
-receives no GitHub API token. Checkout credentials are not persisted.
+Repository variable `CONTROL_URL` points to the existing HTTPS fleet origin.
+Repository secret `JOIN_TOKEN` holds this repository's copy of the fleet join
+credential. No GitHub API token is given to the native agent or its workloads.
+Checkout credentials are not persisted. Workloads and persistent application
+storage are managed by the existing fleet controller.
 
-Use **Actions → Linux fleet agent → Run workflow** to start immediately.
-Disable the workflow to stop requesting replacements and cancel the active run
-to stop the current host.
-
-The fleet machine appears with tag `github-linux` and a label containing the
-repository and workflow run ID. The existing controller chooses its workloads.
+Use Actions → Linux fleet agent → Run workflow to request a run. The optional
+`runtime_minutes` input accepts 30–345 minutes; scheduled runs always use 345.
+Disable the workflow to stop requesting replacements, and cancel its active
+run to stop the current machine. Other account pools are unaffected.
 
 ## Checks
 
-```sh
-python3 -m unittest discover -s tests -v
-```
+`python3 -m unittest discover -s tests -v`
 
-GitHub references: [runner specifications](https://docs.github.com/en/actions/reference/runners/github-hosted-runners),
-[six-hour job limit](https://docs.github.com/en/actions/reference/limits),
+GitHub references: [job limits](https://docs.github.com/en/actions/reference/limits),
+[concurrency](https://docs.github.com/en/actions/how-tos/write-workflows/choose-when-workflows-run/control-workflow-concurrency),
 [schedule behavior](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows#schedule).
