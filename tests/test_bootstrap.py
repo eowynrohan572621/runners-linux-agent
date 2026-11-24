@@ -2,7 +2,6 @@ import hashlib
 import importlib.util
 import io
 from pathlib import Path
-import subprocess
 import tarfile
 import unittest
 
@@ -38,12 +37,14 @@ class BootstrapTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 agent.extract_binary(*pair)
 
-    def test_credentials_are_shell_quoted(self):
+    def test_agent_gets_literal_credentials_without_github_job_tokens(self):
         token = "sample' token; $(printf unexpected)"
-        script = agent.bootstrap_script("https://fleet.example", token, "mac-mini", "Mac #1", 330, b"binary").decode()
-        exports = "\n".join(line for line in script.splitlines() if line.startswith("export "))
-        output = subprocess.check_output(["sh", "-c", exports + '\nprintf "%s" "$JOIN_TOKEN"'])
-        self.assertEqual(output.decode(), token)
+        env = agent.agent_environment("https://fleet.example", token, "github-linux", "Linux #1", 330, b"binary", Path("/tmp/agent"),
+                                      {"PATH": "/usr/bin", "GITHUB_TOKEN": "private", "ACTIONS_RUNTIME_TOKEN": "private"})
+        self.assertEqual(env["JOIN_TOKEN"], token)
+        self.assertEqual(env["PATH"], "/usr/bin")
+        self.assertNotIn("GITHUB_TOKEN", env)
+        self.assertNotIn("ACTIONS_RUNTIME_TOKEN", env)
 
     def test_reject_bad_origin_and_oversized_lease(self):
         for origin in ["http://fleet.example", "https://token@fleet.example", "https://fleet.example/path"]:

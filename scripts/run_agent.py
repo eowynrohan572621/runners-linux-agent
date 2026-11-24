@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run one verified Linux fleet agent inside this macOS job's Docker VM."""
+"""Run one verified native fleet agent on a standard Linux Actions runner."""
 
 import hashlib
 import io
@@ -7,7 +7,7 @@ import json
 import math
 import os
 import re
-import shlex
+from pathlib import Path
 import signal
 import subprocess
 import sys
@@ -16,8 +16,6 @@ import time
 import urllib.parse
 import urllib.request
 
-PROFILE = "runners-mac-mini"
-GUEST_DIR = "/opt/runners-mac-mini"
 MAX_BUNDLE_BYTES = 64 * 1024 * 1024
 STOPPING = False
 
@@ -33,10 +31,10 @@ def configuration(env):
     minutes = int(env.get("MAX_RUNTIME_MINUTES", "345"))
     if not 30 <= minutes <= 345:
         raise ValueError("MAX_RUNTIME_MINUTES must be between 30 and 345")
-    tag = env.get("SERVER_TAG", "github-mac-mini")
+    tag = env.get("SERVER_TAG", "github-linux")
     if not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,29}", tag):
         raise ValueError("Invalid SERVER_TAG")
-    label = "GitHub Mac mini " + env.get("GITHUB_REPOSITORY", "local")
+    label = "GitHub Linux " + env.get("GITHUB_REPOSITORY", "local")
     label += " #" + env.get("GITHUB_RUN_ID", "manual")
     return origin, env["JOIN_TOKEN"], minutes, tag, label
 
@@ -65,26 +63,23 @@ def extract_binary(archive, digest):
         return bundle.extractfile("bin/runner-agent-linux-amd64").read()
 
 
-def guest(*command):
-    return ["colima", "--profile", PROFILE, "ssh", "--", "sudo", "-n", *command]
-
-
-def bootstrap_script(origin, token, tag, label, lifetime, binary):
-    values = {
+def agent_environment(origin, token, tag, label, lifetime, binary, data_dir, source_env):
+    # Do not give workloads GitHub's job/session credentials.
+    values = {key: source_env[key] for key in
+              ("PATH", "HOME", "LANG", "TMPDIR", "SSL_CERT_FILE", "SSL_CERT_DIR")
+              if key in source_env}
+    values.update({
         "CONTROL_URL": origin,
         "AGENT_URL": origin + "/agent",
         "JOIN_TOKEN": token,
         "SERVER_TAG": tag,
         "LABEL": label,
-        "RUNNER_DATA": "/var/lib/runners-mac-mini",
+        "RUNNER_DATA": str(data_dir),
         "RUNNER_CODE_MANAGED": "1",
         "RUNNER_INSTALL_REVISION": hashlib.sha256(binary).hexdigest(),
         "LIFETIME_MIN": str(lifetime),
-    }
-    lines = ["set -eu", "umask 077", "mkdir -p /var/lib/runners-mac-mini"]
-    lines.extend("export " + key + "=" + shlex.quote(value) for key, value in values.items())
-    lines.extend(["echo $$ > /run/runners-mac-mini.pid", "exec " + GUEST_DIR + "/runner-agent"])
-    return ("\n".join(lines) + "\n").encode()
+    })
+    return values
 
 
 def control_request(origin, path, token=None, payload=None):
@@ -117,46 +112,40 @@ def stop_requested(signum, frame):
 def main():
     origin, token, minutes, tag, label = configuration(os.environ)
     if "--check" in sys.argv:
-        log("Configuration is valid; one Mac runner is permitted by the workflow lock")
+        log("Configuration is valid; the workflow permits one Linux runner")
         return 0
-    if sys.platform != "darwin":
-        raise ValueError("This supervisor must run on the macOS workflow runner")
-    started = float(os.environ.get("MAC_JOB_STARTED_AT", time.time()))
+    if sys.platform != "linux":
+        raise ValueError("This supervisor must run on the Linux workflow runner")
+    started = float(os.environ.get("JOB_STARTED_AT", time.time()))
     deadline = started + minutes * 60
     process = None
     joined = None
     for signum in (signal.SIGTERM, signal.SIGINT):
         signal.signal(signum, stop_requested)
     try:
+        subprocess.run(["docker", "info", "--format", "{{.ServerVersion}}"], check=True, timeout=60)
+        subprocess.run(["docker", "compose", "version"], check=True, timeout=60)
         log("Downloading and verifying the control plane's current native agent")
         digest = download(origin + "/agent/rust/bundle.sha256", 256).decode().strip()
         binary = extract_binary(download(origin + "/agent/rust/bundle.tar", MAX_BUNDLE_BYTES), digest)
-        log("Starting one Linux Docker guest using QEMU software emulation")
-        subprocess.run([
-            "colima", "--profile", PROFILE, "start", "--vm-type", "qemu",
-            "--arch", "x86_64", "--cpus", "2", "--memory", "4", "--disk", "12",
-            "--mount-type", "sshfs",
-        ], check=True, timeout=1200)
         if STOPPING:
             return 0
-        subprocess.run(guest("docker", "info", "--format", "{{.ServerVersion}}"), check=True, timeout=120)
-        subprocess.run(guest("docker", "compose", "version"), check=True, timeout=120)
-        install = "umask 077; mkdir -p " + GUEST_DIR
-        install += "; cat > " + GUEST_DIR + "/runner-agent; chmod 700 " + GUEST_DIR + "/runner-agent"
-        subprocess.run(guest("sh", "-ec", install), input=binary, check=True, timeout=180)
+        data_dir = Path(os.environ["RUNNER_TEMP"]) / "runners-agent"
+        data_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+        binary_path = data_dir / "native-agent"
+        binary_path.write_bytes(binary)
+        binary_path.chmod(0o700)
         lifetime = math.floor((deadline - time.time()) / 60)
         if lifetime < 15:
-            raise RuntimeError("Insufficient job time left after VM startup")
+            raise RuntimeError("Insufficient job time left after startup")
         log("Starting the fleet agent with a " + str(lifetime) + " minute lifetime")
-        process = subprocess.Popen(guest("sh", "-s"), stdin=subprocess.PIPE)
-        # The credential travels on SSH stdin, never in command arguments or files.
-        process.stdin.write(bootstrap_script(origin, token, tag, label, lifetime, binary))
-        process.stdin.close()
+        process = subprocess.Popen([str(binary_path)], start_new_session=True,
+            env=agent_environment(origin, token, tag, label, lifetime, binary, data_dir, os.environ))
         join_deadline = min(time.time() + 600, deadline)
         last_check = 0
         while not STOPPING and time.time() < deadline:
             if process.poll() is not None:
-                raise RuntimeError("Agent SSH session exited with code " + str(process.returncode))
+                raise RuntimeError("Agent exited with code " + str(process.returncode))
             if not joined and time.time() - last_check >= 10:
                 last_check = time.time()
                 try:
@@ -168,7 +157,7 @@ def main():
             if not joined and time.time() >= join_deadline:
                 raise RuntimeError("Agent did not join the fleet within ten minutes")
             time.sleep(2)
-        log("Ending this Mac's lease; the workflow's waiting replacement can start next")
+        log("Ending this runner's lease; its waiting replacement can start next")
         return 0
     finally:
         if joined:
@@ -179,15 +168,14 @@ def main():
                 log("Drain request failed; the controller will detect the agent's departure")
         if process is not None:
             try:
-                subprocess.run(guest("sh", "-c", 'test ! -f /run/runners-mac-mini.pid || kill -TERM "$(cat /run/runners-mac-mini.pid)"'), timeout=30, check=False)
+                if process.poll() is None:
+                    os.killpg(process.pid, signal.SIGTERM)
                 process.wait(timeout=60)
-            except (subprocess.TimeoutExpired, OSError):
-                process.kill()
+            except subprocess.TimeoutExpired:
+                os.killpg(process.pid, signal.SIGKILL)
                 process.wait(timeout=10)
-        try:
-            subprocess.run(["colima", "--profile", PROFILE, "stop", "--force"], timeout=90, check=False)
-        except (subprocess.TimeoutExpired, OSError):
-            log("VM stop did not finish; the workflow cleanup step will retry")
+            except ProcessLookupError:
+                process.wait(timeout=10)
 
 
 if __name__ == "__main__":
